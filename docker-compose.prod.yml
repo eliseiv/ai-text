@@ -177,6 +177,10 @@ services:
     command: ["python", "-m", "app.domain.worker"]
     # Graceful stop: SIGTERM stops claiming jobs; a job cut mid-run is re-claimed after its lease.
     stop_grace_period: 60s
+    # The image's HEALTHCHECK probes the api's HTTP port; the worker serves no HTTP, so that probe
+    # would mark it `unhealthy` forever. Liveness = the process runs (restart: unless-stopped).
+    healthcheck:
+      disable: true
     depends_on:
       postgres:
         condition: service_healthy

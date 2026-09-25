@@ -1,11 +1,9 @@
-# CI gate + gated deploy.
-# Any failure on format / lint / types / tests / coverage blocks merge AND blocks deploy.
+# CI gate: format / lint / types / tests / coverage gates / alert rules / image build.
+# Any failure blocks merge AND blocks deploy.
 #
-# DEPLOY ORDERING: deploy is a JOB IN THIS WORKFLOW with `needs: [quality, test, alerts, build-image]`, so
-# GitHub will not start it until every CI job has succeeded. Keeping deploy in a SEPARATE workflow
-# triggered on push:main would let it run in PARALLEL with CI and deploy a red build — that is a
-# real incident from the source service, do not "simplify" it back.
-# Manual / out-of-band redeploys live in deploy.yml (workflow_dispatch only — no push trigger).
+# DEPLOY ORDERING: deploy lives in deploy.yml and is triggered by `workflow_run` of THIS workflow
+# on `main`, only when it concluded `success`. It never runs in parallel with CI and never ships a
+# red build (the incident a plain `push` trigger on deploy.yml would reintroduce).
 name: ci
 
 on:
@@ -13,8 +11,6 @@ on:
     branches: [main]
   pull_request:
 
-# Applies to the CI jobs (quality/test/alerts/build-image). The deploy job sets its OWN job-level
-# concurrency (no cancel) so an in-flight deploy is never cancelled by a superseded CI run.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -186,144 +182,3 @@ jobs:
           tags: service-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  # ---------------------------------------------------------------------------------------------
-  # Gated deploy — shared server + external Traefik over SSH. GATED by `needs` on every CI job:
-  # it is not even queued until quality + test +
-  # alerts + build-image are green, and it only runs on `main`.
-  #
-  # INSTANCE LIST comes from the GitHub Actions VARIABLE `DEPLOY_INSTANCES` (format: `dir:project`
-  # entries separated by spaces, e.g. `myservice:myservice staging:staging`) — never hardcoded
-  # here. A fresh clone of this template has no instances yet: the `vars.DEPLOY_INSTANCES != ''`
-  # guard makes this job SKIPPED (grey), not FAILED (red).
-  #
-  # GitHub Secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY.
-  # GitHub Variables: DEPLOY_INSTANCES.
-  #
-  # ROLLBACK (no registry / immutable tag): on the server, in /opt/<instance>:
-  #   git log --oneline -n 5 ; git checkout <prev-commit>
-  #   docker compose -p <inst> -f docker-compose.prod.yml --env-file .env run --rm migrate
-  #   docker compose -p <inst> -f docker-compose.prod.yml --env-file .env up -d --build
-  # The schema is NOT reverted (expand-only migrations keep the old code compatible).
-  # See infra/deploy/README.md.
-  deploy:
-    name: ssh deploy (shared server + Traefik)
-    runs-on: ubuntu-latest
-    # `alerts` is in the gate on purpose: a regressed money alert must not reach prod. It fails
-    # silently by definition (it just stops firing), so CI is the only place it can be caught.
-    needs: [quality, test, alerts, build-image]
-    # Deploy only from main, only when CI is green, and only when at least one instance is
-    # configured. An unset DEPLOY_INSTANCES ⇒ job skipped, NOT red.
-    if: ${{ github.ref == 'refs/heads/main' && success() && vars.DEPLOY_INSTANCES != '' }}
-    # Optional GitHub Environment for required reviewers / protection rules on prod deploys.
-    environment: production
-    permissions:
-      contents: read
-    # One in-flight deploy; never cancel one mid-run (avoid half-applied state).
-    concurrency:
-      group: deploy-production
-      cancel-in-progress: false
-    steps:
-      - name: Deploy over SSH
-        # PINNED BY COMMIT SHA, not by tag. This third-party action receives SSH_PRIVATE_KEY /
-        # SSH_HOST / SSH_USER — i.e. full access to production. A mutable tag (`@v1.2.0`) can be
-        # re-pointed at new code by a compromised upstream, which would exfiltrate the prod key on
-        # the next run. A SHA cannot be moved. To upgrade: resolve the new tag
-        # (`git ls-remote https://github.com/appleboy/ssh-action refs/tags/<tag>`), review the
-        # diff, then bump the SHA and the trailing comment together.
-        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17  # v1.2.0
-        env:
-          DEPLOY_INSTANCES: ${{ vars.DEPLOY_INSTANCES }}
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DEPLOY_INSTANCES
-          # script_stop MUST stay false. appleboy/ssh-action's `script_stop: true` injects `set -e`
-          # into the remote script REGARDLESS of our `set -uo pipefail`, which would abort the loop
-          # on the FIRST non-zero command and silently drop every later instance. We deliberately do
-          # NOT want `-e`: the loop must visit ALL instances, recording per-instance failures in
-          # FAILED. Real failures are caught by EXPLICIT rc checks (build / migrate) plus the api
-          # readiness gate, and the job goes red via the final `exit 1` — which sits OUTSIDE any
-          # guard, so a real failure can never be swallowed.
-          script_stop: false
-          script: |
-            set -uo pipefail   # NO `-e` on purpose — see the script_stop note above.
-            # WHY build/migrate/up are SPLIT and why `up`'s rc is NOT trusted (incident fix, do not
-            # collapse back into `up -d --build`):
-            # the combined command fuses THREE concerns into ONE exit code — (a) the BuildKit build,
-            # (b) the one-shot `migrate` dependency (restart:"no") that `up` waits on, and (c)
-            # starting api. It can return a TRANSIENT non-zero while api is perfectly healthy, which
-            # falsely reddened the job and aborted the whole instance loop. So:
-            #   1. `compose build`        — a REAL build failure fails this instance.
-            #   2. `compose run migrate`  — a REAL migration failure fails this instance.
-            #   3. `compose up --no-build`— start only; rc recorded but NOT trusted.
-            #   4. readiness gate on the api container health status (compose healthcheck = GET
-            #      /ready: db + redis) — THE source of truth for "did this deploy work".
-            # Nothing is masked: build error, migration error and api-not-healthy all fail the
-            # instance; only the spurious `up` exit code is ignored.
-            INSTANCES="${DEPLOY_INSTANCES:-}"
-            if [ -z "$INSTANCES" ]; then
-              echo "::error title=No instances::DEPLOY_INSTANCES is empty"; exit 1
-            fi
-            FAILED=""   # instances that REALLY failed; the job goes red at the end if non-empty
-            for entry in $INSTANCES; do
-              dir="${entry%%:*}"; proj="${entry##*:}"
-              echo "[deploy] === instance dir=/opt/$dir project=$proj ==="
-              cd "/opt/$dir" || { echo "::error title=cd failed ($proj)::/opt/$dir missing"; FAILED="$FAILED $proj"; continue; }
-              echo "[deploy:$proj] git pull"
-              if ! git pull --ff-only; then
-                echo "::error title=git pull failed ($proj)::ff-only pull failed in /opt/$dir"; FAILED="$FAILED $proj"; continue
-              fi
-              echo "[deploy:$proj] build (image built on the server)"
-              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env build api migrate; then
-                echo "::error title=build failed ($proj)::docker compose build returned non-zero"; FAILED="$FAILED $proj"; continue
-              fi
-              echo "[deploy:$proj] migrate (alembic upgrade head) — BEFORE api starts"
-              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate; then
-                echo "::error title=migrate failed ($proj)::alembic upgrade head returned non-zero"; FAILED="$FAILED $proj"; continue
-              fi
-              echo "[deploy:$proj] up -d --no-build (rc recorded, not trusted; the readiness gate decides)"
-              up_rc=0
-              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --no-build || up_rc=$?
-              echo "[deploy:$proj] up rc=$up_rc (informational)"
-              echo "[deploy:$proj] readiness gate: api container health (30 x 2s)"
-              ready=0
-              for i in $(seq 1 30); do
-                h="$(docker inspect "${proj}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
-                if [ "$h" = "healthy" ]; then echo "[deploy:$proj] api healthy ($i)"; ready=1; break; fi
-                echo "[deploy:$proj] api health=$h ($i/30) — retrying in 2s"; sleep 2
-              done
-              if [ "$ready" -ne 1 ]; then
-                echo "::error title=api not healthy ($proj)::api did not become healthy within ~60s (up rc=$up_rc). Last logs:"
-                docker logs "${proj}-api-1" --tail 40 2>&1 || true
-                FAILED="$FAILED $proj"; continue
-              fi
-              # Per-instance public smoke through Traefik (TLS + Host routing), against THIS
-              # instance's own SERVICE_DOMAIN read from its /opt/$dir/.env — not one global domain.
-              # NON-FATAL: on a first deploy the A-record / Let's Encrypt cert may still be settling,
-              # and the deploy itself (build + migrate + healthy api) has already succeeded.
-              inst_domain="$(grep -E '^SERVICE_DOMAIN=' .env | head -n1 | cut -d= -f2- | tr -d '\"'"'"' ' || true)"
-              if [ -z "$inst_domain" ]; then
-                echo "::warning title=Smoke skipped ($proj)::no SERVICE_DOMAIN in /opt/$dir/.env"
-              else
-                url="https://$inst_domain/healthz"
-                echo "[smoke:$proj] GET $url"
-                smoke_ok=0
-                for i in $(seq 1 12); do
-                  if curl -fsS --max-time 5 "$url" >/dev/null; then echo "[smoke:$proj] healthz OK"; smoke_ok=1; break; fi
-                  echo "[smoke:$proj] not ready ($i/12) — retrying in 5s"; sleep 5
-                done
-                if [ "$smoke_ok" -ne 1 ]; then
-                  echo "::warning title=Smoke /healthz not green ($proj)::$url did not return 200 within 60s. Build+migrate+up succeeded and api is healthy in-container; public DNS propagation or Traefik's ACME cert may still be settling on a first deploy."
-                fi
-              fi
-            done
-            echo "[deploy] prune dangling build layers (best-effort)"
-            docker image prune -f || true
-            # Job verdict: red iff at least one instance REALLY failed (build / migrate / api health).
-            if [ -n "$FAILED" ]; then
-              echo "::error title=Deploy failed::instance(s) failed:$FAILED"
-              exit 1
-            fi
-            echo "[deploy] all instances deployed and healthy"

@@ -1,21 +1,31 @@
-# MANUAL / out-of-band deploy — shared server + external Traefik over SSH.
+# Deploy to the shared server behind the external Traefik (/opt/edge) over SSH.
 #
-# The PRIMARY, automatic deploy on push to main is the `deploy` JOB inside
-# .github/workflows/ci.yml, gated by `needs: [quality, test, alerts, build-image]` so it cannot start
-# until the whole CI suite is green. This file is `workflow_dispatch` ONLY — for a manual redeploy
-# (e.g. re-run after DNS/cert settle, or redeploy the current main HEAD without a new commit).
-# Do NOT add a `push` trigger here, or deploy will again race CI and can ship a red build.
+# WHEN: automatically after every push to `main` — but only once the `ci` workflow for that push
+# has finished GREEN (`workflow_run` + `conclusion == success`), so a red build is never shipped.
+# Manual re-deploy of the current `main`: Actions → deploy → Run workflow.
 #
-# The deploy steps are IDENTICAL to the gated job in ci.yml (same hardened logic: split
-# build/migrate/up, untrusted `up` rc, readiness gate, non-fatal smoke, per-instance FAILED).
+# WHAT (on the server, in /opt/gelnora, compose project `gelnora`):
+#   1. check out EXACTLY the commit CI tested (never an older one — no accidental rollback);
+#   2. `compose build api migrate`   — the image is built on the server (no registry);
+#   3. `compose run --rm migrate`    — alembic upgrade head, BEFORE the new api starts;
+#   4. `compose up -d --no-build`    — api + worker (+ postgres/redis); rc NOT trusted;
+#   5. readiness gate: `gelnora-api-1` healthy (GET /ready: db + redis) and the worker running;
+#   6. public smoke `https://$SERVICE_DOMAIN/healthz` through Traefik (non-fatal: DNS/ACME).
+# Traefik itself is never touched: routing comes from the api container labels.
 #
-# GitHub Secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY.
-# GitHub Variables: DEPLOY_INSTANCES (`dir:project` entries, space-separated). Unset ⇒ this job is
-# SKIPPED (grey), not red — a fresh clone of the template has no instances yet.
+# GitHub Secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY. Application secrets live in
+# /opt/gelnora/.env on the server (gitignored), never in the repository or the image.
+#
+# ROLLBACK: on the server — cd /opt/gelnora && git log --oneline -n 5 && git checkout -B main <sha>
+# then steps 2–4 by hand (see infra/deploy/README.md). The schema is not reverted (expand-only).
 
 name: deploy
 
 on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -25,89 +35,96 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  DEPLOY_DIR: /opt/gelnora
+  COMPOSE_PROJECT: gelnora
+
 jobs:
   deploy:
-    name: ssh deploy (shared server + Traefik)
+    name: ssh deploy → gelnora.shop
     runs-on: ubuntu-latest
-    if: ${{ vars.DEPLOY_INSTANCES != '' }}
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.event == 'push') }}
     environment: production
     steps:
       - name: Deploy over SSH
-        # PINNED BY COMMIT SHA — see the long note in ci.yml. This action receives the production
-        # SSH key; a mutable tag could be re-pointed by a compromised upstream and leak it.
+        # PINNED BY COMMIT SHA, not by tag: this action receives the production SSH key, and a
+        # mutable tag could be re-pointed by a compromised upstream. Upgrade = resolve the new tag
+        # (`git ls-remote https://github.com/appleboy/ssh-action refs/tags/<tag>`), review, bump.
         uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17  # v1.2.0
         env:
-          DEPLOY_INSTANCES: ${{ vars.DEPLOY_INSTANCES }}
+          # The commit CI tested (workflow_run) or the current main head (manual run).
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || '' }}
+          DEPLOY_DIR: ${{ env.DEPLOY_DIR }}
+          COMPOSE_PROJECT: ${{ env.COMPOSE_PROJECT }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DEPLOY_INSTANCES
-          # script_stop MUST stay false — see the long note in ci.yml. `true` injects `set -e` and
-          # would abort the instance loop on the first non-zero command, dropping later instances.
+          envs: DEPLOY_SHA,DEPLOY_DIR,COMPOSE_PROJECT
+          command_timeout: 30m
+          # `script_stop: true` would inject `set -e`; failures are handled by explicit rc checks.
           script_stop: false
           script: |
-            set -uo pipefail   # NO `-e` on purpose (the loop must visit ALL instances).
-            # Same incident-hardened flow as ci.yml: (1) build, (2) migrate, (3) up --no-build with
-            # its rc recorded but NOT trusted, (4) readiness gate on api container health = the
-            # source of truth. Real failures (build / migrate / api-not-healthy) still go red.
-            INSTANCES="${DEPLOY_INSTANCES:-}"
-            if [ -z "$INSTANCES" ]; then
-              echo "::error title=No instances::DEPLOY_INSTANCES is empty"; exit 1
+            set -uo pipefail
+            proj="$COMPOSE_PROJECT"
+            dc() { docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env "$@"; }
+            fail() { echo "::error title=Deploy failed::$1"; exit 1; }
+
+            cd "$DEPLOY_DIR" || fail "$DEPLOY_DIR missing — provision the instance first"
+            [ -f .env ] || fail "$DEPLOY_DIR/.env missing"
+
+            echo "[deploy] fetch"
+            git fetch --prune origin || fail "git fetch failed"
+            target="${DEPLOY_SHA:-$(git rev-parse origin/main)}"
+            current="$(git rev-parse HEAD)"
+            # Never move BACKWARDS: an out-of-order run for an older commit must not roll prod back.
+            if [ "$current" != "$target" ] && git merge-base --is-ancestor "$target" "$current"; then
+              echo "::warning title=Skipped::$target is older than the deployed $current — nothing to do"
+              exit 0
             fi
-            FAILED=""
-            for entry in $INSTANCES; do
-              dir="${entry%%:*}"; proj="${entry##*:}"
-              echo "[deploy] === instance dir=/opt/$dir project=$proj ==="
-              cd "/opt/$dir" || { echo "::error title=cd failed ($proj)::/opt/$dir missing"; FAILED="$FAILED $proj"; continue; }
-              echo "[deploy:$proj] git pull"
-              if ! git pull --ff-only; then
-                echo "::error title=git pull failed ($proj)::ff-only pull failed in /opt/$dir"; FAILED="$FAILED $proj"; continue
-              fi
-              echo "[deploy:$proj] build (image built on the server)"
-              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env build api migrate; then
-                echo "::error title=build failed ($proj)::docker compose build returned non-zero"; FAILED="$FAILED $proj"; continue
-              fi
-              echo "[deploy:$proj] migrate (alembic upgrade head) — BEFORE api starts"
-              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate; then
-                echo "::error title=migrate failed ($proj)::alembic upgrade head returned non-zero"; FAILED="$FAILED $proj"; continue
-              fi
-              echo "[deploy:$proj] up -d --no-build (rc recorded, not trusted; the readiness gate decides)"
-              up_rc=0
-              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --no-build || up_rc=$?
-              echo "[deploy:$proj] up rc=$up_rc (informational)"
-              echo "[deploy:$proj] readiness gate: api container health (30 x 2s)"
-              ready=0
-              for i in $(seq 1 30); do
-                h="$(docker inspect "${proj}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
-                if [ "$h" = "healthy" ]; then echo "[deploy:$proj] api healthy ($i)"; ready=1; break; fi
-                echo "[deploy:$proj] api health=$h ($i/30) — retrying in 2s"; sleep 2
-              done
-              if [ "$ready" -ne 1 ]; then
-                echo "::error title=api not healthy ($proj)::api did not become healthy within ~60s (up rc=$up_rc). Last logs:"
-                docker logs "${proj}-api-1" --tail 40 2>&1 || true
-                FAILED="$FAILED $proj"; continue
-              fi
-              inst_domain="$(grep -E '^SERVICE_DOMAIN=' .env | head -n1 | cut -d= -f2- | tr -d '\"'"'"' ' || true)"
-              if [ -z "$inst_domain" ]; then
-                echo "::warning title=Smoke skipped ($proj)::no SERVICE_DOMAIN in /opt/$dir/.env"
-              else
-                url="https://$inst_domain/healthz"
-                echo "[smoke:$proj] GET $url"
-                smoke_ok=0
-                for i in $(seq 1 12); do
-                  if curl -fsS --max-time 5 "$url" >/dev/null; then echo "[smoke:$proj] healthz OK"; smoke_ok=1; break; fi
-                  echo "[smoke:$proj] not ready ($i/12) — retrying in 5s"; sleep 5
-                done
-                if [ "$smoke_ok" -ne 1 ]; then
-                  echo "::warning title=Smoke /healthz not green ($proj)::$url did not return 200 within 60s. Build+migrate+up succeeded and api is healthy in-container; DNS/ACME may still be settling."
-                fi
-              fi
+            git checkout -q -B main "$target" || fail "checkout $target failed"
+            echo "[deploy] at $(git log --oneline -1)"
+
+            echo "[deploy] build (image built on the server)"
+            dc build api migrate || fail "docker compose build failed"
+
+            echo "[deploy] migrate (alembic upgrade head) — before the new api starts"
+            dc run --rm migrate || fail "migration failed"
+
+            echo "[deploy] up -d --no-build (rc informational; the readiness gate decides)"
+            up_rc=0; dc up -d --no-build --remove-orphans || up_rc=$?
+            echo "[deploy] up rc=$up_rc"
+
+            echo "[deploy] readiness gate: ${proj}-api-1 healthy (60 x 2s)"
+            ready=0
+            for i in $(seq 1 60); do
+              h="$(docker inspect "${proj}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
+              [ "$h" = "healthy" ] && { ready=1; echo "[deploy] api healthy ($i)"; break; }
+              sleep 2
             done
-            echo "[deploy] prune dangling build layers (best-effort)"
-            docker image prune -f || true
-            if [ -n "$FAILED" ]; then
-              echo "::error title=Deploy failed::instance(s) failed:$FAILED"
-              exit 1
+            if [ "$ready" -ne 1 ]; then
+              docker logs "${proj}-api-1" --tail 60 2>&1 || true
+              fail "api did not become healthy (up rc=$up_rc)"
             fi
-            echo "[deploy] all instances deployed and healthy"
+            w="$(docker inspect "${proj}-worker-1" --format '{{.State.Status}}' 2>/dev/null || echo none)"
+            if [ "$w" != "running" ]; then
+              docker logs "${proj}-worker-1" --tail 60 2>&1 || true
+              fail "worker is not running (state=$w)"
+            fi
+
+            domain="$(grep -E '^SERVICE_DOMAIN=' .env | head -n1 | cut -d= -f2- | tr -d "\"' ")"
+            if [ -n "$domain" ]; then
+              url="https://$domain/healthz"
+              ok=0
+              for i in $(seq 1 12); do
+                curl -fsS --max-time 5 "$url" >/dev/null && { ok=1; echo "[smoke] $url OK"; break; }
+                sleep 5
+              done
+              [ "$ok" -eq 1 ] || echo "::warning title=Smoke not green::$url did not answer 200 within 60s (DNS / Let's Encrypt may still be settling); the api is healthy in-container."
+            fi
+
+            docker image prune -f >/dev/null 2>&1 || true
+            echo "[deploy] done: $(git log --oneline -1)"

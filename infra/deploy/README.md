@@ -41,8 +41,6 @@ docker compose -p <instance> -f docker-compose.prod.yml --env-file .env up -d --
 curl -fsS https://<SERVICE_DOMAIN>/healthz
 ```
 
-Затем добавить инстанс в GitHub Actions **Variable** `DEPLOY_INSTANCES` (формат `dir:project`,
-через пробел, напр. `myservice:myservice staging:staging`) — и он попадёт в автодеплой.
 
 Перед приёмом реальных пользователей пройти **prod-readiness checklist**:
 `TRUSTED_PROXY_IPS`, `PRODUCTS`, Apple root CA, `DOCS_ENABLED=false`, бэкап PostgreSQL,
@@ -68,16 +66,18 @@ curl -fsS https://<SERVICE_DOMAIN>/healthz
 
 ## CI/CD
 
-- `ci.yml`: `quality` (ruff format/check + mypy) → `test` (pytest + coverage-гейты) →
-  `build-image` (валидация Dockerfile, без push) → `deploy` (**gated**
-  `needs: [quality, test, build-image]`, только `main`).
-- `deploy.yml`: то же, но `workflow_dispatch`-only. Push-триггер сюда **не добавлять** — иначе
-  деплой снова начнёт гоняться с CI и сможет выкатить красную сборку.
-- Список инстансов — из Variable `DEPLOY_INSTANCES`. Пусто → job **skipped** (серый), не красный.
-- `appleboy/ssh-action` запинен по **commit SHA**, не по тегу: этому action передаётся прод-SSH-ключ,
-  а mutable-тег скомпрометированный upstream может перенацелить на новый код. Обновление —
-  `git ls-remote https://github.com/appleboy/ssh-action refs/tags/<tag>`, ревью диффа, затем бамп SHA
-  вместе с комментарием-тегом.
+- `ci.yml` (push в `main` и PR): `quality` (ruff format/check + mypy) → `test` (pytest +
+  coverage-гейты) → `alerts` (promtool) → `build-image` (валидация Dockerfile, без push).
+- `deploy.yml`: запускается `workflow_run` **после зелёного `ci`** по push в `main` (красная сборка
+  не выкатывается и не гоняется параллельно с CI), плюс ручной запуск (`workflow_dispatch`).
+  SSH на сервер → `/opt/gelnora`: checkout ровно протестированного коммита (более старый коммит не
+  выкатывается) → `build api migrate` → `run --rm migrate` → `up -d --no-build` → readiness-gate
+  (`gelnora-api-1` healthy, `gelnora-worker-1` running) → non-fatal smoke
+  `https://gelnora.shop/healthz`.
+- `appleboy/ssh-action` запинен по **commit SHA**, не по тегу: этому action передаётся прод-SSH-ключ.
+
+**Инстанс:** каталог `/opt/gelnora`, compose-проект `gelnora`, домен `gelnora.shop`
+(A-запись → IP сервера). Секреты приложения — только в `/opt/gelnora/.env` и `/opt/gelnora/.secrets`.
 
 **Coverage-гейты:** 80% глобально + **95% на каждый** критический
 пакет (`policy`, `wallet`, `auth`, `generation`, `billing*`, `subscription`, `token_purchase`).
@@ -87,7 +87,6 @@ curl -fsS https://<SERVICE_DOMAIN>/healthz
 проверяется отдельно поверх тех же данных (`coverage report --include=... --fail-under=95`).
 
 **GitHub Secrets:** `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`.
-**GitHub Variables:** `DEPLOY_INSTANCES`.
 
 ## Наблюдаемость (опциональный overlay)
 
