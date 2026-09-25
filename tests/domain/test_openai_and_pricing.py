@@ -186,3 +186,19 @@ def test_quote_equals_charge() -> None:
     )
     assert quoted == charged == 7
     assert pricing.quote(kind="answer", model=None, params={}) == 1
+
+
+def test_empty_base_url_env_does_not_break_the_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`OPENAI_BASE_URL=` (empty) in .env must not become base_url="" (UnsupportedProtocol)."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "")
+    client = OpenAILLMClient(
+        api_keys=["k"],
+        base_url="",
+        proxy_urls=[],
+        models={"default": "gpt-5.1"},
+        reasoning={},
+        max_output_tokens=10,
+        timeout=5,
+        max_retries=0,
+    )
+    assert str(client._clients[0].base_url).rstrip("/") == "https://api.openai.com/v1"

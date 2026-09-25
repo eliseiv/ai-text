@@ -26,6 +26,8 @@ from app.observability.logging import log_event
 
 logger = logging.getLogger("app.domain.llm")
 
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+
 
 class LLMError(Exception):
     def __init__(self, code: str, message: str | None = None, *, retryable: bool = False) -> None:
@@ -99,7 +101,10 @@ class OpenAILLMClient:
                 self._clients.append(
                     openai.AsyncOpenAI(
                         api_key=key or "missing",
-                        base_url=base_url or None,
+                        # Never None: with None the SDK falls back to the OPENAI_BASE_URL env var,
+                        # and an EMPTY `OPENAI_BASE_URL=` in .env becomes base_url="" — every call
+                        # then fails with APIConnectionError (UnsupportedProtocol).
+                        base_url=base_url or DEFAULT_OPENAI_BASE_URL,
                         timeout=timeout,
                         max_retries=max_retries,
                         http_client=http_client,
