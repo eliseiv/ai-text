@@ -1,0 +1,217 @@
+# Alert rules for the service core.
+#
+# EVERY expression below uses ONLY metrics that the app actually emits — an alert on a metric
+# nobody emits never fires and gives false comfort, which is exactly the failure mode the payment
+# alerts exist to prevent.
+#
+# The domain adds ITS OWN rules in a separate file mounted into /etc/prometheus/rules — these
+# core rules are not edited by a new service.
+groups:
+  - name: core-availability
+    rules:
+      # Readiness — /ready (db + redis) is the compose healthcheck; Prometheus observes the same
+      # process through scrape health: a container failing /ready is restarted / unscrapeable.
+      - alert: ReadinessDown
+        expr: up{job="backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend target {{ $labels.instance }} is not scrapeable"
+          description: "Prometheus cannot scrape /metrics for >1m — the api is down or /ready is failing (PostgreSQL / Redis unavailable)."
+
+      # Gateway rate-limiting is an HTTP-429 concern (blocked_requests_total is BUSINESS blocks
+      # only, and deliberately has NO `rate_limited` reason).
+      - alert: RateLimitedSpike
+        expr: sum(rate(http_responses_total{status="429"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained 429 responses"
+          description: "http_responses_total{status=429} > 1/s for 10m — abuse, a misbehaving client, or a rate limit set too low."
+
+  - name: core-billing
+    rules:
+      # ALL billing alerts below match on `impact` — the INVARIANT ("what this means for the money")
+      # — and NEVER on `reason`. This is a hard rule, and
+      # it is not stylistic:
+      #
+      #   A regex over `reason` freezes TODAY'S list of causes. A new cause with the SAME meaning
+      #   then falls silently out of the alert — which keeps "working", it just stops seeing part of
+      #   the failures. That is the worst possible failure mode for a money alert: it looks healthy.
+      #   This was not hypothetical here — `missing_customer_user_id` / `missing_user_id` are
+      #   lost-payment outcomes that the old `reason="user_not_found"` matcher was ALREADY blind to.
+      #
+      # `impact` is a closed set {lost_payment, refund_needed, upstream, none}, assigned by a
+      # SYMMETRIC predicate over the exit path (op, reason) — not by judgement, and not by `reason`
+      # alone: the SAME reason means different things on different paths (`unknown_product` in
+      # token_purchase = Apple already took the money => lost_payment; the same reason in checkout =
+      # no payment exists yet => none). Every (op, reason) pair must declare an impact satisfying
+      # BOTH sides of the predicate, or the test fails.
+      #
+      # Because these expressions match on `impact`, a reclassification of outcomes between classes
+      # — even the removal of an entire class — changes NOT ONE character of any expression here:
+      # only the membership of the classes changes, in the app's (op, reason) -> impact mapping.
+      # That is the entire point of matching on the invariant rather than on a list of causes.
+      #
+      # All of them watch `billing_outcome_total`, not `payment_events_total`: the latter only exists
+      # once a `payments` row is written, but the outcomes that lose money abort BEFORE the journal
+      # (user resolution, JWS verification, product lookup). An alert on the journal would be dead
+      # on exactly the scenarios it exists for.
+      #
+      # Grouped by (channel, op, reason) so the on-call sees WHICH path fired and which runbook to
+      # open — `reason` is for diagnosis, never for matching.
+
+      # THE money alert: payment confirmed, credits never granted, and the failure was UNINTENTIONAL
+      # (we could not credit). Remedy: fix the cause and GRANT THE CREDITS. This exact incident class
+      # happened twice in the source service.
+      #
+      # Split in two ONLY to vary `for:` — same alert name, same class, mutually exclusive series:
+      # the public CloudPayments webhook takes UNAUTHENTICATED callbacks, so anyone can forge one
+      # with a random deviceId and produce `user_not_found` at will. At `for: 0m` that is an
+      # alert-DoS vector, and an alert that cries wolf gets muted — taking the REAL lost payments
+      # down with it. 10m of sustained failures is not something a forger can fake cheaply, while a
+      # genuine incident (a broken resolve) persists well past 10m. Every other path is authenticated
+      # (Adapty bearer, StoreKit JWS) and cannot be forged, so it pages immediately.
+      - alert: BillingLostPayment
+        expr: |
+          sum by (channel, op, reason) (rate(billing_outcome_total{impact="lost_payment"}[15m])) > 0
+          unless
+          sum by (channel, op, reason) (rate(billing_outcome_total{impact="lost_payment",channel="cloudpayments",op="webhook"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          # Distinguishes the two BillingLostPayment rules. Required: promtool lints two rules with
+          # the same alert name AND the same label set as duplicates, even when their series are
+          # mutually exclusive. Also useful for routing (the two have different debounce semantics).
+          ingress: authenticated
+        annotations:
+          summary: "Payment received but not credited"
+          description: "billing_outcome_total{impact=lost_payment} > 0 — channel={{ $labels.channel }} op={{ $labels.op }} reason={{ $labels.reason }}. Money was confirmed and the user was NOT credited. Most expensive failure class. Remedy: fix the cause and GRANT the owed credits."
+
+      # Same class, public CloudPayments webhook only — debounced against forged-callback alert-DoS.
+      - alert: BillingLostPayment
+        expr: sum by (channel, op, reason) (rate(billing_outcome_total{impact="lost_payment",channel="cloudpayments",op="webhook"}[15m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+          ingress: public_webhook
+        annotations:
+          summary: "Payment received but not credited (CloudPayments webhook)"
+          description: "billing_outcome_total{impact=lost_payment,channel=cloudpayments,op=webhook} sustained for 10m — reason={{ $labels.reason }}. The public webhook is unauthenticated, so isolated spikes may be forged callbacks; a SUSTAINED rate means real payments are not being credited. Remedy: fix the cause and GRANT the owed credits."
+
+      # Money was taken and the credits will NEVER be granted: policy refused AFTER the payment was
+      # confirmed (e.g. subscription_required in consumable IAP). The remedy is the OPPOSITE of
+      # BillingLostPayment — do not grant, REFUND. Hence a separate alert and a separate runbook.
+      - alert: BillingRefundNeeded
+        expr: sum by (channel, op, reason) (rate(billing_outcome_total{impact="refund_needed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Payment taken, credits refused — manual refund required"
+          description: "billing_outcome_total{impact=refund_needed} > 0 — channel={{ $labels.channel }} op={{ $labels.op }} reason={{ $labels.reason }}. The user was charged and policy then refused the grant, so the credits will never arrive. Remedy: REFUND the payment (do NOT grant). Opposite of BillingLostPayment — do not confuse the runbooks."
+
+      # A probably-paid operation was not confirmed / not completed by an external system. The most
+      # likely prod cause is OPERATIONAL, not an attack: the Apple root CA is unmounted (empty
+      # APPSTORE_ROOT_CERT_DIR → fail-closed 422) or expired — which is why it sits in the
+      # prod-readiness checklist. `invalid_json` lives here too: a drift in the platform's payload
+      # format SILENTLY LOSES EVERY GRANT, and that has already happened in prod.
+      # `critical` is justified because the class no longer contains any noisy reason
+      # (`unknown_event_type` was moved out to `none`) — a noisy reason inside a class devalues the
+      # expensive reason sharing it, because after two false pages the alert gets ignored.
+      - alert: BillingUpstreamFailing
+        expr: sum by (channel, op, reason) (rate(billing_outcome_total{impact="upstream"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Billing upstream not confirming operations"
+          description: "billing_outcome_total{impact=upstream} > 0 — channel={{ $labels.channel }} op={{ $labels.op }} reason={{ $labels.reason }}. A probably-paid operation was not confirmed. If reason=invalid_transaction: check the Apple root CA is mounted at APPSTORE_ROOT_CERT_DIR and unexpired (an empty dir is fail-closed → 422). If reason=invalid_json: the platform's payload format drifted and grants are being lost silently. VERIFY THE MONEY MANUALLY — it may already have been taken."
+
+      # The aggregator is unreachable / malformed: webhooks answer 500 (retriable), so real
+      # payments are queued in the provider's retry loop and are NOT yet credited.
+      - alert: WebhookVerifyFailing
+        expr: sum(rate(cloudpayments_verify_errors_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Payment verification is failing"
+          description: "cloudpayments_verify_errors_total{reason={{ $labels.reason }}} > 0 for 5m — each sample is one 500-retriable webhook. Payments are pending in the aggregator's retry queue until this recovers."
+
+      # Ledger integrity (BR-3): sustained debit failures mean generations are being served, or
+      # refused, against a broken wallet.
+      - alert: WalletDebitFailures
+        expr: sum(rate(wallet_debit_total{result="fail"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Wallet debit failures observed"
+          description: "wallet_debit_total{result=fail} > 0 sustained for 10m — investigate the ledger."
+
+  - name: core-generation
+    rules:
+      # The generation loop carries the SAME `impact` invariant as billing (R-OBS-1..5). Matching on
+      # `status` or on a list of block-reasons would rebuild the exact defect impact-matching outlawed — and
+      # here it is WORSE than in billing, because the extension point is USED: every service built
+      # from this template registers its own domain `policy_gates`, each bringing its own block
+      # reasons. Without an invariant label, every one of those reasons would land outside the alerts
+      # automatically. A domain gate that rejects an ALREADY-PAID operation must declare
+      # revenue_loss / user_blocked, or the test fails (R-OBS-5).
+
+      # THE revenue alert, and a genuinely invisible path until now: an under-estimating `quote()`
+      # lets policy admit the generation, the provider does the work, and the debit then finds too
+      # few credits -> the row is marked succeeded with billing_kind='unbilled'. The user correctly
+      # gets the result for free (they are never pushed negative) — and NOBODY FINDS OUT, because no
+      # metric covered this path. The service could give away generations for months.
+      - alert: GenerationUnbilled
+        expr: sum by (kind, provider) (rate(generation_total{impact="revenue_loss"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Generations delivered without charging"
+          description: "generation_total{impact=revenue_loss} > 0 — kind={{ $labels.kind }} provider={{ $labels.provider }}. The provider delivered a result and the service charged NOTHING (billing_kind='unbilled': quote() under-estimated the price, so the debit came up short). The behaviour is correct, the revenue is gone. Recalibrate PRICING_* against the provider's real usage."
+
+      # The generation provider degraded (ProviderError: upstream 5xx / timeouts). Matched on the
+      # INVARIANT, not on `status`: a failed generation charges nothing, so this is an availability
+      # alert, not a money one — hence `warning`, deliberately not `critical` (R-OBS-4: a noisy
+      # critical trains the on-call to ignore the whole class, including the expensive members).
+      - alert: GenerationUpstreamErrors
+        expr: sum by (kind, provider) (rate(generation_total{impact="upstream"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Generation provider is failing"
+          description: "generation_total{impact=upstream} > 0.1/s for 5m — provider {{ $labels.provider }} (kind={{ $labels.kind }}) is degraded. Users get 502; no credits are charged for a failed generation, so this is availability, not lost revenue."
+
+      # Stuck generations (TD-006). The process died between the `running` anchor and finalisation,
+      # so rows never reach a terminal state. Consequence for the user: their Idempotency-Key stays
+      # pinned to a `running` row, so every retry answers 409 already_in_progress — they are locked
+      # out of that request permanently. There is no reaper yet, so this alert IS the detector.
+      #
+      # Condition: the running gauge never returned to zero
+      # during the window AND is not decreasing. Both halves are load-bearing — a healthy busy
+      # service constantly finalises work, so its gauge oscillates and `deriv` dips below zero;
+      # a stuck backlog holds a floor above zero and only grows. `min_over_time > 0` alone would
+      # fire on any sustained load; `deriv >= 0` alone would fire on a normal ramp-up.
+      #
+      # Fed by `generations_inflight{status}` — the same
+      # count the step-1.5 inflight-guard already computes over `ix_generations_inflight`, so the
+      # gauge costs nothing extra. The 10m window sits well above the 2 x GENERATION_TIMEOUT_SECONDS
+      # (default 2 x 120s) after which a `running` row is by definition overdue.
+      - alert: GenerationStuck
+        expr: |
+          min_over_time(generations_inflight{status="running"}[10m]) > 0
+          and
+          deriv(generations_inflight{status="running"}[10m]) >= 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Generations stuck in `running`"
+          description: "generations_inflight{status=running} has not dropped to zero for 10m and is not decreasing — rows are stuck between the anchor and finalisation (TD-006). Affected users are locked on their Idempotency-Key with 409 already_in_progress. No reaper exists yet: inspect ix_generations_inflight and fail the overdue rows."

@@ -1,0 +1,51 @@
+# ── Secrets / env ───────────────────────────────────────────────
+# Ignore .env and ANY .env.* (local, prod, staging, …) — these hold real secrets, provisioned
+# from the secret manager, NEVER committed. Committed templates are the *.example files
+# (placeholders only) — re-included below.
+.env
+.env.*
+!.env.example
+!.env.prod.example
+
+# RSA keypair of the embedded JWT issuer and any locally generated secret — never commit.
+.secrets/
+# Observability overlay scrape token (real token never committed).
+infra/observability/secrets/scrape_token
+
+# Defense-in-depth: never commit private keys / certs anywhere in the tree.
+*.pem
+*.key
+*.p12
+*.cer
+*.der
+*.crt
+
+# ── Python ──────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ── IDE / editor ────────────────────────────────────────────────
+.idea/
+.vscode/
+
+# ── Local scratch / run artifacts ───────────────────────────────
+*_err.txt
+*.log
+*.jpg
+*.jpeg
+*.png
+
+# ── Agent tooling (orchestration kitchen, not the service) ──────
+# NOTE: CLAUDE.md is NOT ignored — it is part of the template. Only the local agent config
+# directory stays out of the repo.
+.claude

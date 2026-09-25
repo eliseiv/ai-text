@@ -1,0 +1,329 @@
+# CI gate + gated deploy.
+# Any failure on format / lint / types / tests / coverage blocks merge AND blocks deploy.
+#
+# DEPLOY ORDERING: deploy is a JOB IN THIS WORKFLOW with `needs: [quality, test, alerts, build-image]`, so
+# GitHub will not start it until every CI job has succeeded. Keeping deploy in a SEPARATE workflow
+# triggered on push:main would let it run in PARALLEL with CI and deploy a red build — that is a
+# real incident from the source service, do not "simplify" it back.
+# Manual / out-of-band redeploys live in deploy.yml (workflow_dispatch only — no push trigger).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Applies to the CI jobs (quality/test/alerts/build-image). The deploy job sets its OWN job-level
+# concurrency (no cancel) so an in-flight deploy is never cancelled by a superseded CI run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.4.30"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  quality:
+    name: lint • format • types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps (uv sync)
+        run: uv sync --frozen
+
+      - name: Format check (ruff)
+        run: uv run ruff format --check .
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type-check (mypy)
+        run: uv run mypy src
+
+  test:
+    name: test • coverage gate
+    runs-on: ubuntu-latest
+    # Integration tests use testcontainers, which need a Docker daemon (present on ubuntu-latest).
+    # No `services:` declared on purpose — testcontainers manages PostgreSQL/Redis itself.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps (uv sync)
+        run: uv sync --frozen
+
+      # Global gate: 80%.
+      - name: Pytest + coverage (global gate 80%)
+        run: >
+          uv run pytest
+          --cov=src
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=80
+
+      # Critical packages must hit >=95% EACH: policy, wallet, auth, generation and every billing*
+      # package — everywhere a bug costs money or access.
+      #
+      # PER-PACKAGE, not aggregate. Passing all ten paths to a single `--cov-fail-under=95` would
+      # gate their UNION: wallet at 85% would sail through on the back of policy at 99% — i.e. the
+      # gate would be weakest exactly where it matters most. Instead we reuse the `.coverage` data
+      # written by the global step above (so the suite runs ONCE, not twice) and assert each
+      # package on its own, collecting failures so the log lists EVERY package below the bar.
+      - name: Critical-package coverage gate (>=95% per package)
+        run: |
+          set -uo pipefail
+          FAILED=""
+          for p in policy wallet auth generation billing billing_common billing_adapty \
+                   billing_cloudpayments subscription token_purchase; do
+            echo "::group::coverage gate — app/$p (>=95%)"
+            if ! uv run coverage report --include="src/app/$p/*" --fail-under=95 --show-missing; then
+              FAILED="$FAILED $p"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$FAILED" ]; then
+            echo "::error title=Coverage below 95%::package(s) under the critical gate:$FAILED"
+            exit 1
+          fi
+          echo "all critical packages are >= 95%"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------------------------
+  # Alert rules — FORM *and* BEHAVIOUR.
+  #
+  # `promtool check rules` only validates syntax. It cannot catch the bug class that actually keeps
+  # happening in this ruleset: an alert over a metric nobody emits, a matcher blind to part of its
+  # own class, two rules double-paging one series. Each is valid YAML and valid PromQL; each is
+  # invisible to a reader. They surface ONLY by running the rules against series and observing what
+  # fires — which is what `promtool test rules` does (infra/observability/rules/alerts_test.yml).
+  #
+  # This is a blocking gate, not a nicety: the alerts are the ONLY guard on the money path in prod,
+  # and when they regress they go QUIET — indistinguishable from "everything is fine". `deploy`
+  # needs this job, so a broken money alert cannot reach production.
+  alerts:
+    name: alert rules • syntax + behaviour
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same pinned Prometheus image as the observability overlay — the validator matches what runs.
+      - name: promtool check rules + test rules + check config
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/infra/observability:/obs" \
+            --entrypoint sh prom/prometheus:v2.54.1 -c '
+              set -e
+              cd /obs
+              echo "== check rules (syntax) =="
+              promtool check rules rules/alerts.yml
+              echo "== test rules (behaviour) =="
+              promtool test rules alerts_test.yml
+              echo "== check config (scrape configs) =="
+              # Mirrors the real prod mount: rules/ -> /etc/prometheus/rules, which both configs load
+              # via the glob rule_files: /etc/prometheus/rules/*.yml. This is what proves no non-rule
+              # file (e.g. the test file) has crept into that directory — one would make Prometheus
+              # fail to load its config and the whole observability stack would refuse to start.
+              # The scrape-token file is provisioned on the server and never committed; a dummy lets
+              # promtool resolve the http_headers file reference.
+              mkdir -p /etc/prometheus/secrets && echo dummy > /etc/prometheus/secrets/scrape_token
+              cp -r /obs/rules /etc/prometheus/rules
+              promtool check config /obs/prometheus.yml /obs/prometheus.prod.yml
+            '
+
+  build-image:
+    name: build docker image (validation only)
+    runs-on: ubuntu-latest
+    needs: [quality, test]
+    # The deployable image is BUILT ON THE SERVER, NOT pushed to
+    # a registry. This job only VALIDATES that the Dockerfile builds — no registry login, no push
+    # (hence no `packages: write`).
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push — validation)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: false
+          tags: service-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------------------------
+  # Gated deploy — shared server + external Traefik over SSH. GATED by `needs` on every CI job:
+  # it is not even queued until quality + test +
+  # alerts + build-image are green, and it only runs on `main`.
+  #
+  # INSTANCE LIST comes from the GitHub Actions VARIABLE `DEPLOY_INSTANCES` (format: `dir:project`
+  # entries separated by spaces, e.g. `myservice:myservice staging:staging`) — never hardcoded
+  # here. A fresh clone of this template has no instances yet: the `vars.DEPLOY_INSTANCES != ''`
+  # guard makes this job SKIPPED (grey), not FAILED (red).
+  #
+  # GitHub Secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY.
+  # GitHub Variables: DEPLOY_INSTANCES.
+  #
+  # ROLLBACK (no registry / immutable tag): on the server, in /opt/<instance>:
+  #   git log --oneline -n 5 ; git checkout <prev-commit>
+  #   docker compose -p <inst> -f docker-compose.prod.yml --env-file .env run --rm migrate
+  #   docker compose -p <inst> -f docker-compose.prod.yml --env-file .env up -d --build
+  # The schema is NOT reverted (expand-only migrations keep the old code compatible).
+  # See infra/deploy/README.md.
+  deploy:
+    name: ssh deploy (shared server + Traefik)
+    runs-on: ubuntu-latest
+    # `alerts` is in the gate on purpose: a regressed money alert must not reach prod. It fails
+    # silently by definition (it just stops firing), so CI is the only place it can be caught.
+    needs: [quality, test, alerts, build-image]
+    # Deploy only from main, only when CI is green, and only when at least one instance is
+    # configured. An unset DEPLOY_INSTANCES ⇒ job skipped, NOT red.
+    if: ${{ github.ref == 'refs/heads/main' && success() && vars.DEPLOY_INSTANCES != '' }}
+    # Optional GitHub Environment for required reviewers / protection rules on prod deploys.
+    environment: production
+    permissions:
+      contents: read
+    # One in-flight deploy; never cancel one mid-run (avoid half-applied state).
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH
+        # PINNED BY COMMIT SHA, not by tag. This third-party action receives SSH_PRIVATE_KEY /
+        # SSH_HOST / SSH_USER — i.e. full access to production. A mutable tag (`@v1.2.0`) can be
+        # re-pointed at new code by a compromised upstream, which would exfiltrate the prod key on
+        # the next run. A SHA cannot be moved. To upgrade: resolve the new tag
+        # (`git ls-remote https://github.com/appleboy/ssh-action refs/tags/<tag>`), review the
+        # diff, then bump the SHA and the trailing comment together.
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17  # v1.2.0
+        env:
+          DEPLOY_INSTANCES: ${{ vars.DEPLOY_INSTANCES }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DEPLOY_INSTANCES
+          # script_stop MUST stay false. appleboy/ssh-action's `script_stop: true` injects `set -e`
+          # into the remote script REGARDLESS of our `set -uo pipefail`, which would abort the loop
+          # on the FIRST non-zero command and silently drop every later instance. We deliberately do
+          # NOT want `-e`: the loop must visit ALL instances, recording per-instance failures in
+          # FAILED. Real failures are caught by EXPLICIT rc checks (build / migrate) plus the api
+          # readiness gate, and the job goes red via the final `exit 1` — which sits OUTSIDE any
+          # guard, so a real failure can never be swallowed.
+          script_stop: false
+          script: |
+            set -uo pipefail   # NO `-e` on purpose — see the script_stop note above.
+            # WHY build/migrate/up are SPLIT and why `up`'s rc is NOT trusted (incident fix, do not
+            # collapse back into `up -d --build`):
+            # the combined command fuses THREE concerns into ONE exit code — (a) the BuildKit build,
+            # (b) the one-shot `migrate` dependency (restart:"no") that `up` waits on, and (c)
+            # starting api. It can return a TRANSIENT non-zero while api is perfectly healthy, which
+            # falsely reddened the job and aborted the whole instance loop. So:
+            #   1. `compose build`        — a REAL build failure fails this instance.
+            #   2. `compose run migrate`  — a REAL migration failure fails this instance.
+            #   3. `compose up --no-build`— start only; rc recorded but NOT trusted.
+            #   4. readiness gate on the api container health status (compose healthcheck = GET
+            #      /ready: db + redis) — THE source of truth for "did this deploy work".
+            # Nothing is masked: build error, migration error and api-not-healthy all fail the
+            # instance; only the spurious `up` exit code is ignored.
+            INSTANCES="${DEPLOY_INSTANCES:-}"
+            if [ -z "$INSTANCES" ]; then
+              echo "::error title=No instances::DEPLOY_INSTANCES is empty"; exit 1
+            fi
+            FAILED=""   # instances that REALLY failed; the job goes red at the end if non-empty
+            for entry in $INSTANCES; do
+              dir="${entry%%:*}"; proj="${entry##*:}"
+              echo "[deploy] === instance dir=/opt/$dir project=$proj ==="
+              cd "/opt/$dir" || { echo "::error title=cd failed ($proj)::/opt/$dir missing"; FAILED="$FAILED $proj"; continue; }
+              echo "[deploy:$proj] git pull"
+              if ! git pull --ff-only; then
+                echo "::error title=git pull failed ($proj)::ff-only pull failed in /opt/$dir"; FAILED="$FAILED $proj"; continue
+              fi
+              echo "[deploy:$proj] build (image built on the server)"
+              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env build api migrate; then
+                echo "::error title=build failed ($proj)::docker compose build returned non-zero"; FAILED="$FAILED $proj"; continue
+              fi
+              echo "[deploy:$proj] migrate (alembic upgrade head) — BEFORE api starts"
+              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate; then
+                echo "::error title=migrate failed ($proj)::alembic upgrade head returned non-zero"; FAILED="$FAILED $proj"; continue
+              fi
+              echo "[deploy:$proj] up -d --no-build (rc recorded, not trusted; the readiness gate decides)"
+              up_rc=0
+              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --no-build || up_rc=$?
+              echo "[deploy:$proj] up rc=$up_rc (informational)"
+              echo "[deploy:$proj] readiness gate: api container health (30 x 2s)"
+              ready=0
+              for i in $(seq 1 30); do
+                h="$(docker inspect "${proj}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
+                if [ "$h" = "healthy" ]; then echo "[deploy:$proj] api healthy ($i)"; ready=1; break; fi
+                echo "[deploy:$proj] api health=$h ($i/30) — retrying in 2s"; sleep 2
+              done
+              if [ "$ready" -ne 1 ]; then
+                echo "::error title=api not healthy ($proj)::api did not become healthy within ~60s (up rc=$up_rc). Last logs:"
+                docker logs "${proj}-api-1" --tail 40 2>&1 || true
+                FAILED="$FAILED $proj"; continue
+              fi
+              # Per-instance public smoke through Traefik (TLS + Host routing), against THIS
+              # instance's own SERVICE_DOMAIN read from its /opt/$dir/.env — not one global domain.
+              # NON-FATAL: on a first deploy the A-record / Let's Encrypt cert may still be settling,
+              # and the deploy itself (build + migrate + healthy api) has already succeeded.
+              inst_domain="$(grep -E '^SERVICE_DOMAIN=' .env | head -n1 | cut -d= -f2- | tr -d '\"'"'"' ' || true)"
+              if [ -z "$inst_domain" ]; then
+                echo "::warning title=Smoke skipped ($proj)::no SERVICE_DOMAIN in /opt/$dir/.env"
+              else
+                url="https://$inst_domain/healthz"
+                echo "[smoke:$proj] GET $url"
+                smoke_ok=0
+                for i in $(seq 1 12); do
+                  if curl -fsS --max-time 5 "$url" >/dev/null; then echo "[smoke:$proj] healthz OK"; smoke_ok=1; break; fi
+                  echo "[smoke:$proj] not ready ($i/12) — retrying in 5s"; sleep 5
+                done
+                if [ "$smoke_ok" -ne 1 ]; then
+                  echo "::warning title=Smoke /healthz not green ($proj)::$url did not return 200 within 60s. Build+migrate+up succeeded and api is healthy in-container; public DNS propagation or Traefik's ACME cert may still be settling on a first deploy."
+                fi
+              fi
+            done
+            echo "[deploy] prune dangling build layers (best-effort)"
+            docker image prune -f || true
+            # Job verdict: red iff at least one instance REALLY failed (build / migrate / api health).
+            if [ -n "$FAILED" ]; then
+              echo "::error title=Deploy failed::instance(s) failed:$FAILED"
+              exit 1
+            fi
+            echo "[deploy] all instances deployed and healthy"

@@ -1,0 +1,385 @@
+# Behavioural unit tests for alerts.yml — run by `promtool test rules` in CI (job `alerts`).
+#
+# WHY THIS FILE EXISTS. `promtool check rules` validates FORM (syntax). It cannot catch the class of
+# bug that has bitten this ruleset repeatedly:
+#   - an alert over a metric nobody emits            -> valid YAML, valid PromQL, never fires;
+#   - a matcher blind to part of its own class       -> valid, fires, silently misses failures;
+#   - two rules double-paging the same series        -> valid, wakes the on-call twice.
+# All three are invisible to a reader and to `check rules`. They are only visible by RUNNING the
+# rules against series and observing what fires. Alerts are the only guard on the money path in
+# prod: when they regress they go QUIET, which is indistinguishable from "everything is fine".
+#
+# DESIGN RULE FOR THESE TESTS: assert behaviour on LABELS (`impact`, `channel`, `op`), NEVER on a
+# specific `reason` value. The (op, reason) -> impact matrix is owned by the app and is expected to
+# keep changing; the alert expressions match on `impact` precisely so that such churn does not touch
+# them. The `reason` values below are therefore deliberately FICTIONAL (`reason_x`, ...): if a test
+# ever needs a real reason to pass, the rule has started depending on `reason` — which is banned —
+# and the test SHOULD fail.
+
+# LOCATION MATTERS — this file lives one level ABOVE rules/ and must NEVER be moved into it.
+# `rules/` is bind-mounted into Prometheus as /etc/prometheus/rules, and both scrape configs load
+# `rule_files: /etc/prometheus/rules/*.yml`. A test file inside that directory gets picked up by the
+# glob and parsed AS A RULE FILE — Prometheus then fails to load its config and the entire
+# observability stack refuses to start. Found by running the real CI step, which reported:
+#   alerts_test.yml: field tests not found in type rulefmt.RuleGroups
+#
+# Run from infra/observability/:  promtool test rules alerts_test.yml
+rule_files:
+  - rules/alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------------------------
+  # REGRESSION GUARD (the whole point). A lost_payment series MUST raise BillingLostPayment.
+  # If anyone renames the metric or the `impact` label, or narrows the matcher, this goes red.
+  # This is the guard on the class of bug we spent six rounds fixing.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: lost_payment always pages (dead-alert guard)
+    input_series:
+      - series: 'billing_outcome_total{impact="lost_payment",channel="apple_storekit",op="subscription_sync",reason="reason_x",result="ignored"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: BillingLostPayment
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              ingress: authenticated
+              channel: apple_storekit
+              op: subscription_sync
+              reason: reason_x
+            exp_annotations:
+              summary: "Payment received but not credited"
+              description: "billing_outcome_total{impact=lost_payment} > 0 — channel=apple_storekit op=subscription_sync reason=reason_x. Money was confirmed and the user was NOT credited. Most expensive failure class. Remedy: fix the cause and GRANT the owed credits."
+
+  # ---------------------------------------------------------------------------------------------
+  # The two BillingLostPayment rules: mutually exclusive series + the public-webhook debounce.
+  # Both paths fail at the same constant rate; only the debounce differs.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: public webhook is debounced, authenticated paths page immediately
+    input_series:
+      # Public, unauthenticated -> forgeable -> must wait out `for: 10m`.
+      - series: 'billing_outcome_total{impact="lost_payment",channel="cloudpayments",op="webhook",reason="reason_x",result="ignored"}'
+        values: "0+1x40"
+      # Authenticated (bearer) -> cannot be forged -> must page at once.
+      - series: 'billing_outcome_total{impact="lost_payment",channel="adapty",op="webhook",reason="reason_x",result="ignored"}'
+        values: "0+1x40"
+    alert_rule_test:
+      # At 5m: ONLY the authenticated path fires. Proves (a) the debounce holds and (b) the two
+      # rules are mutually exclusive — cloudpayments must NOT appear under ingress=authenticated,
+      # i.e. the `unless` really carves it out and there is no double page.
+      - eval_time: 5m
+        alertname: BillingLostPayment
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              ingress: authenticated
+              channel: adapty
+              op: webhook
+              reason: reason_x
+            exp_annotations:
+              summary: "Payment received but not credited"
+              description: "billing_outcome_total{impact=lost_payment} > 0 — channel=adapty op=webhook reason=reason_x. Money was confirmed and the user was NOT credited. Most expensive failure class. Remedy: fix the cause and GRANT the owed credits."
+      # At 20m: the public webhook has sustained past 10m -> it pages too. Exactly ONE alert per
+      # path — never two for the same series.
+      - eval_time: 20m
+        alertname: BillingLostPayment
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              ingress: authenticated
+              channel: adapty
+              op: webhook
+              reason: reason_x
+            exp_annotations:
+              summary: "Payment received but not credited"
+              description: "billing_outcome_total{impact=lost_payment} > 0 — channel=adapty op=webhook reason=reason_x. Money was confirmed and the user was NOT credited. Most expensive failure class. Remedy: fix the cause and GRANT the owed credits."
+          - exp_labels:
+              severity: critical
+              ingress: public_webhook
+              channel: cloudpayments
+              op: webhook
+              reason: reason_x
+            exp_annotations:
+              summary: "Payment received but not credited (CloudPayments webhook)"
+              description: "billing_outcome_total{impact=lost_payment,channel=cloudpayments,op=webhook} sustained for 10m — reason=reason_x. The public webhook is unauthenticated, so isolated spikes may be forged callbacks; a SUSTAINED rate means real payments are not being credited. Remedy: fix the cause and GRANT the owed credits."
+
+  # ---------------------------------------------------------------------------------------------
+  # refund_needed raises its OWN alert (opposite remedy: refund, do not grant) and must NOT be
+  # swept into BillingLostPayment — confusing the two runbooks would double-charge or double-refund.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: refund_needed pages separately and never as lost_payment
+    input_series:
+      - series: 'billing_outcome_total{impact="refund_needed",channel="apple_storekit",op="token_purchase",reason="reason_y",result="rejected"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: BillingRefundNeeded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              channel: apple_storekit
+              op: token_purchase
+              reason: reason_y
+            exp_annotations:
+              summary: "Payment taken, credits refused — manual refund required"
+              description: "billing_outcome_total{impact=refund_needed} > 0 — channel=apple_storekit op=token_purchase reason=reason_y. The user was charged and policy then refused the grant, so the credits will never arrive. Remedy: REFUND the payment (do NOT grant). Opposite of BillingLostPayment — do not confuse the runbooks."
+      - eval_time: 5m
+        alertname: BillingLostPayment
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------------------------
+  # upstream pages (probably-paid operation not confirmed).
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: upstream pages
+    input_series:
+      - series: 'billing_outcome_total{impact="upstream",channel="apple_storekit",op="token_purchase",reason="reason_z",result="error"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: BillingUpstreamFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              channel: apple_storekit
+              op: token_purchase
+              reason: reason_z
+            exp_annotations:
+              summary: "Billing upstream not confirming operations"
+              description: "billing_outcome_total{impact=upstream} > 0 — channel=apple_storekit op=token_purchase reason=reason_z. A probably-paid operation was not confirmed. If reason=invalid_transaction: check the Apple root CA is mounted at APPSTORE_ROOT_CERT_DIR and unexpired (an empty dir is fail-closed → 422). If reason=invalid_json: the platform's payload format drifted and grants are being lost silently. VERIFY THE MONEY MANUALLY — it may already have been taken."
+
+  # ---------------------------------------------------------------------------------------------
+  # PAGING HYGIENE (predicate P2). `impact=none` is the benign path — no money taken, nothing broken.
+  # It must NEVER wake anyone, at ANY rate, on ANY billing alert. A noisy reason inside a paging
+  # class devalues the expensive reason next to it: after two false pages the alert gets muted, and
+  # the real lost payment is muted with it. High rate on purpose (10/min) to make the point.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: impact=none never pages
+    input_series:
+      - series: 'billing_outcome_total{impact="none",channel="adapty",op="webhook",reason="reason_x",result="noop"}'
+        values: "0+10x30"
+      - series: 'billing_outcome_total{impact="none",channel="cloudpayments",op="checkout",reason="reason_y",result="rejected"}'
+        values: "0+10x30"
+      - series: 'billing_outcome_total{impact="none",channel="apple_storekit",op="token_purchase",reason="reason_z",result="applied"}'
+        values: "0+10x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BillingLostPayment
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: BillingRefundNeeded
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: BillingUpstreamFailing
+        exp_alerts: []
+
+  # =============================================================================================
+  # GENERATION LOOP (R-OBS-1..5). Same invariant machinery as billing: alerts match on `impact`,
+  # never on `status` or on a list of block reasons.
+  #
+  # This matters MORE here than in billing, because the extension point is USED: every service built
+  # from this template registers its own domain policy_gates, each with its own block reasons. If the
+  # alerts matched a list of reasons, every domain reason would fall outside them automatically — the
+  # template would ship a blind spot to every service built from it.
+  #
+  # `kind` below is deliberately FICTIONAL (`kind_a`), exactly like the fictional `reason`s above:
+  # the rules must not depend on any particular generation kind, and a test that needs a real one is
+  # evidence the rule has started depending on it.
+  # =============================================================================================
+
+  # ---------------------------------------------------------------------------------------------
+  # REGRESSION GUARD for the revenue path — the one that was INVISIBLE until this iteration.
+  # An impact=revenue_loss series MUST raise GenerationUnbilled. Rename the metric or the label,
+  # or narrow the matcher to `status`, and this goes red.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: revenue_loss always pages (dead-alert guard for unbilled generations)
+    input_series:
+      # succeeded + billing_kind=unbilled: the provider delivered, the service charged nothing.
+      - series: 'generation_total{impact="revenue_loss",kind="kind_a",provider="provider_a",status="succeeded"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: GenerationUnbilled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              kind: kind_a
+              provider: provider_a
+            exp_annotations:
+              summary: "Generations delivered without charging"
+              description: "generation_total{impact=revenue_loss} > 0 — kind=kind_a provider=provider_a. The provider delivered a result and the service charged NOTHING (billing_kind='unbilled': quote() under-estimated the price, so the debit came up short). The behaviour is correct, the revenue is gone. Recalibrate PRICING_* against the provider's real usage."
+      # A revenue loss is NOT an upstream failure — the two must not cross-fire.
+      - eval_time: 5m
+        alertname: GenerationUpstreamErrors
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------------------------
+  # Provider degradation: matched on impact=upstream, NOT on status="failed".
+  # Threshold is a RATE (>0.1/s), so it needs real volume — 12/min ≈ 0.2/s clears it.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: upstream pages on provider degradation (matched on impact, not status)
+    input_series:
+      - series: 'generation_total{impact="upstream",kind="kind_a",provider="provider_a",status="failed"}'
+        values: "0+12x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GenerationUpstreamErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: kind_a
+              provider: provider_a
+            exp_annotations:
+              summary: "Generation provider is failing"
+              description: "generation_total{impact=upstream} > 0.1/s for 5m — provider provider_a (kind=kind_a) is degraded. Users get 502; no credits are charged for a failed generation, so this is availability, not lost revenue."
+      # An upstream failure charges nothing, so it is NOT a revenue loss.
+      - eval_time: 10m
+        alertname: GenerationUnbilled
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------------------------
+  # FORWARD-GUARD: the rules must match `impact`, NEVER `status`.
+  #
+  # Under the CURRENT core predicate these two are coextensive — generation_impact() maps
+  # status=="failed" -> "upstream" unconditionally — so no test over realistic series can tell a
+  # status-matched rule from an impact-matched one. That is precisely the trap: someone could
+  # "simplify" the rule back to status="failed" today and every realistic test would still pass,
+  # re-introducing the defect that impact-matching outlawed, silently.
+  #
+  # The series below is therefore SYNTHETIC: a failure that is NOT an upstream failure (impact=none)
+  # is not producible by today's core classifier. It is exactly what a domain WILL produce once it
+  # classifies a failure of its own (R-OBS-5) — e.g. a provider rejecting invalid params: the
+  # generation failed, nothing is broken, nobody should be paged. Locking it now means the day that
+  # state becomes real, the alert is already correct — and a rule reverted to `status` fails here
+  # instead of quietly paging on every benign failure.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: rules match impact, not status (forward-guard against a status-matched rule)
+    input_series:
+      # status=failed but impact=none: a benign failure. High rate — a status-matched rule would
+      # page hard on this; an impact-matched rule must stay silent.
+      - series: 'generation_total{impact="none",kind="kind_a",provider="provider_a",status="failed"}'
+        values: "0+30x30"
+      # status=succeeded but impact=none: an ordinary paid success. A GenerationUnbilled rule
+      # matched on status="succeeded" would page on every successful generation.
+      - series: 'generation_total{impact="none",kind="kind_a",provider="provider_a",status="succeeded"}'
+        values: "0+30x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GenerationUpstreamErrors
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GenerationUnbilled
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------------------------
+  # PAGING HYGIENE in the generation loop (R-OBS-4). impact=none is the benign path: a normal
+  # success, or a policy block of an UNPAID request (the user simply has not paid — nothing broke).
+  # It must never page, at any volume. High rate (30/min) on purpose: if `none` could page, an
+  # ordinary traffic spike would wake the on-call and, after two false pages, GenerationUnbilled
+  # would be muted right along with it.
+  # ---------------------------------------------------------------------------------------------
+  - interval: 1m
+    name: generation impact=none never pages
+    input_series:
+      - series: 'generation_total{impact="none",kind="kind_a",provider="provider_a",status="succeeded"}'
+        values: "0+30x30"
+      - series: 'generation_total{impact="none",kind="kind_a",provider="provider_a",status="blocked"}'
+        values: "0+30x30"
+      - series: 'generation_total{impact="none",kind="kind_a",provider="provider_a",status="replayed"}'
+        values: "0+30x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GenerationUnbilled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GenerationUpstreamErrors
+        exp_alerts: []
+
+  # =============================================================================================
+  # GenerationStuck — the most fragile expression in the ruleset:
+  #     min_over_time(generations_inflight{status="running"}[10m]) > 0
+  #     and
+  #     deriv(generations_inflight{status="running"}[10m]) >= 0
+  # BOTH halves are load-bearing, and each guards a DIFFERENT failure mode:
+  #   - drop `min_over_time > 0`  -> pages on any healthy service that momentarily has work in flight;
+  #   - drop `deriv >= 0`         -> pages on a busy service whose backlog is DRAINING (i.e. fine);
+  #   - invert either sign        -> the alert goes silent on the very incident it exists for.
+  # All of these are valid PromQL and pass `check rules`. They are only visible by running series
+  # through the rule — and both failure modes (silence / constant false critical) are invisible to a
+  # reader. Three groups below, one per property.
+  # =============================================================================================
+
+  # 1. STUCK: a floor above zero that never drains. Rows are wedged between the `running` anchor and
+  #    finalisation (TD-006); the affected users are locked on their Idempotency-Key with a 409
+  #    forever. This MUST page. (Guards against the alert going silent.)
+  - interval: 1m
+    name: GenerationStuck fires on a non-draining backlog
+    input_series:
+      - series: 'generations_inflight{status="running"}'
+        values: "3+0x25"   # flat 3: never zero, never decreasing
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GenerationStuck
+        exp_alerts:
+          # `status` passes through: the expression does not aggregate, so the series label survives.
+          - exp_labels:
+              severity: critical
+              status: running
+            exp_annotations:
+              summary: "Generations stuck in `running`"
+              description: "generations_inflight{status=running} has not dropped to zero for 10m and is not decreasing — rows are stuck between the anchor and finalisation (TD-006). Affected users are locked on their Idempotency-Key with 409 already_in_progress. No reaper exists yet: inspect ix_generations_inflight and fail the overdue rows."
+
+  # 2. HEALTHY (busy, oscillating): a working service constantly finalises generations, so the gauge
+  #    repeatedly returns to zero. It must NEVER page. This is what turns the claim in the rule's
+  #    comment ("a healthy service oscillates") into a CHECKED assertion, and it guards R-OBS-4:
+  #    a false critical on ordinary load trains the on-call to ignore the alert, and the real stuck
+  #    backlog gets ignored with it. Locks the `min_over_time > 0` half.
+  - interval: 1m
+    name: GenerationStuck stays silent on a healthy oscillating service
+    input_series:
+      - series: 'generations_inflight{status="running"}'
+        values: "0 2 1 0 3 1 0 2 0 1 0 2 0 1 0 0 2 0 1 0 0"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GenerationStuck
+        exp_alerts: []
+
+  # 3. IDLE: the gauge sits flat at zero — no work in flight at all. Nothing is stuck; nobody may be
+  #    paged. This locks the `min_over_time > 0` half from the OTHER side: weaken it to `>= 0` and it
+  #    becomes always-true (a gauge is never negative), degenerating the rule to `deriv >= 0` alone —
+  #    which is TRUE for a flat-zero series. An idle service would then page forever. Note the
+  #    oscillating group above does NOT catch this (its deriv happens to be negative, masking the
+  #    bug), which is exactly why this group exists.
+  - interval: 1m
+    name: GenerationStuck stays silent on an idle service
+    input_series:
+      - series: 'generations_inflight{status="running"}'
+        values: "0+0x25"   # flat zero: deriv == 0, so only `min_over_time > 0` keeps this quiet
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GenerationStuck
+        exp_alerts: []
+
+  # 4. HEALTHY (busy, DRAINING — never idle): a permanently loaded service whose backlog never hits
+  #    zero but is steadily shrinking. Work IS being finalised, so nothing is stuck and nobody should
+  #    be paged. This is the ONLY case that locks the `deriv >= 0` half: here `min_over_time > 0` is
+  #    TRUE, so the first half alone would fire — only the derivative tells "draining" apart from
+  #    "wedged". Without this group, inverting or deleting the deriv term would go unnoticed.
+  - interval: 1m
+    name: GenerationStuck stays silent while a busy backlog is draining
+    input_series:
+      - series: 'generations_inflight{status="running"}'
+        values: "30-1x20"   # 30 -> 10: always > 0 (min_over_time passes), but strictly decreasing
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GenerationStuck
+        exp_alerts: []

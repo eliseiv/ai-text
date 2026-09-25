@@ -1,0 +1,199 @@
+# Production stack — shared server behind an EXTERNAL Traefik edge-proxy. Standalone prod file:
+# it does NOT extend or
+# override docker-compose.yml (that one is the local dev artifact).
+#
+# Topology: the server's Traefik (/opt/edge) owns ports 80/443, terminates TLS, issues Let's
+# Encrypt certs and routes by Host. Our stack contains NO reverse proxy and publishes NO
+# 80/443. `api` is reachable ONLY through Traefik over the EXTERNAL docker network `web`
+# (created once on the server: `docker network create web`). postgres / redis live ONLY on the
+# internal `default` network with NO published ports.
+#
+# The image is BUILT ON THE SERVER from the sources in /opt/<instance> — not pulled from a
+# registry. Rollback = `git checkout <prev-commit>` + rebuild (infra/deploy/README.md).
+#
+# Bring-up (on the server, in /opt/<instance>, after `git pull`):
+#   docker compose -p <inst> -f docker-compose.prod.yml --env-file .env build api migrate
+#   docker compose -p <inst> -f docker-compose.prod.yml --env-file .env run --rm migrate
+#   docker compose -p <inst> -f docker-compose.prod.yml --env-file .env up -d --no-build
+#
+# Secrets come from `.env` on the server (provisioned from the secret manager), loaded via
+# env_file — never baked into the image. `.env` is gitignored;
+# `.env.prod.example` is the placeholder template.
+
+# Bounded container logs. The default json-file driver grows WITHOUT LIMIT, and gunicorn writes an
+# access-log line per request. On a shared server hosting several instances plus Traefik, one busy
+# instance would eventually fill the disk and take down EVERY instance and the edge-proxy with it.
+# 10m x 3 = at most 30 MB per container. Ship logs off-host if you need longer retention.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16.4-bookworm
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No host port published and NOT on `web`: reachable only on the internal `default` network.
+    networks:
+      - default
+    healthcheck:
+      # Use the CONTAINER's own env (`$$` passes a literal `$`, so the shell INSIDE the container
+      # expands it at runtime) — NOT compose interpolation, whose values may contain shell
+      # metacharacters (e.g. a `<placeholder>`) and break the check at compose time.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    # Container default max_connections=100; keep (DB_POOL_SIZE+DB_MAX_OVERFLOW)*workers below it.
+    # Raise here only after recomputing.
+    # command: ["postgres", "-c", "max_connections=100"]
+
+  redis:
+    image: redis:7.4-bookworm
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - redisdata:/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # One-shot migration job (`alembic upgrade head`). Runs to completion BEFORE api starts
+  # (service_completed_successfully below) and is ALSO invoked explicitly by the deploy workflow
+  # (`compose run --rm migrate`). Migrations are expand-only, so the old api keeps serving while
+  # this runs.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Multi-instance: the image tag is parameterised by COMPOSE_PROJECT_NAME, so two instances on
+    # the same host never share an image tag. Deploy with `-p <inst>`.
+    image: ${COMPOSE_PROJECT_NAME:-service}-backend:prod
+    restart: "no"
+    logging: *default-logging
+    env_file:
+      - .env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # migrate only needs DB access -> internal network only.
+    networks:
+      - default
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-service}-backend:prod
+    restart: unless-stopped
+    # gunicorn logs every request — this is the container that would fill the disk first.
+    logging: *default-logging
+    env_file:
+      - .env
+    # The in-container Apple-root path is INFRASTRUCTURE wiring: it must equal the bind-mount
+    # target below, regardless of any per-instance `.env` value (`environment:` wins over
+    # `env_file:`). An EMPTY certs dir is benign — the app finds no roots and StoreKit stays
+    # fail-closed (422); the container starts normally.
+    environment:
+      APPSTORE_ROOT_CERT_DIR: /etc/appstore-certs
+      FILES_DIR: /data/files
+    # RUNTIME bind mounts (never baked into the image):
+    #  - ./.secrets  : the RSA keypair of the embedded JWT issuer (JWT_PRIVATE_KEY_PATH /
+    #                  JWT_PUBLIC_KEY_PATH). Gitignored; the operator generates it per instance.
+    #  - ./certs/appstore : Apple root CA for REAL StoreKit JWS verification. The dir is committed
+    #                  (certs/appstore/.gitkeep) so docker never auto-creates a root-owned path.
+    # Both READ-ONLY: the non-root runtime user (uid 10001) only reads them.
+    volumes:
+      - ./.secrets:/app/.secrets:ro
+      - ./certs/appstore:/etc/appstore-certs:ro
+      # Originals of user materials (PDF / text / web snapshots), shared with the worker.
+      - filedata:/data/files
+    # NO `ports:` — we MUST NOT publish 80/443 or any host port (conflict with Traefik). Only
+    # `expose` the internal 8000 so Traefik can reach it over `web`. Direct internet access to
+    # api / postgres / redis is closed by the absence of published ports.
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      # `web`     — external, shared with Traefik (inbound proxying to api:8000).
+      # `default` — internal, for api <-> postgres/redis.
+      - web
+      - default
+    # App-level readiness (GET /ready: db + redis). This container health status is the SOURCE OF
+    # TRUTH for the deploy readiness-gate.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    # --- Traefik routing via docker-labels. NO TLS/ACME/nginx/Caddy is configured by us — TLS is
+    #     entirely Traefik's responsibility. Router/service NAMES are parameterised by
+    #     COMPOSE_PROJECT_NAME so instances behind the SHARED Traefik never collide.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-service}.rule=Host(`${SERVICE_DOMAIN:?set SERVICE_DOMAIN in .env}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-service}.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-service}.tls=true"
+      # ACME cert-resolver name configured in the shared Traefik (/opt/edge) by the server owner.
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-service}.tls.certresolver=${TRAEFIK_CERTRESOLVER:?set TRAEFIK_CERTRESOLVER in .env (ACME resolver name from /opt/edge, e.g. le)}"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-service}.loadbalancer.server.port=8000"
+
+  # Background worker: import, indexing, answers, summaries, purges. Same image as api, no inbound
+  # traffic (internal network only; outbound to the LLM API and to user-given article URLs).
+  worker:
+    image: ${COMPOSE_PROJECT_NAME:-service}-backend:prod
+    restart: unless-stopped
+    logging: *default-logging
+    env_file:
+      - .env
+    environment:
+      FILES_DIR: /data/files
+    volumes:
+      - filedata:/data/files
+    command: ["python", "-m", "app.domain.worker"]
+    # Graceful stop: SIGTERM stops claiming jobs; a job cut mid-run is re-claimed after its lease.
+    stop_grace_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+
+networks:
+  # External network shared with the Traefik edge-proxy. Created once on the server:
+  #   docker network create web
+  web:
+    external: true
+  # Internal stack network for api <-> postgres/redis.
+  default:
+
+volumes:
+  pgdata:
+  redisdata:
+  filedata:

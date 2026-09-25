@@ -1,0 +1,35 @@
+# Optional LOCAL observability overlay: Prometheus scraping api /metrics.
+# Usage:
+#   1) put your scrape token into infra/observability/secrets/scrape_token (gitignored)
+#      and set the SAME value as METRICS_SCRAPE_TOKEN in .env
+#   2) docker compose -f docker-compose.yml -f docker-compose.observability.yml up
+#
+# The token file is mounted read-only; it is NOT baked into any image.
+
+services:
+  prometheus:
+    # v2.49+ required for per-job http_headers (see infra/observability/prometheus.yml).
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    volumes:
+      - ./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/observability/rules:/etc/prometheus/rules:ro
+      # Mount the DIRECTORY, not the token FILE. The token is gitignored and absent from a fresh
+      # clone — bind-mounting a missing path makes Docker CREATE it as a root-owned DIRECTORY,
+      # after which Prometheus can't read the token and the path can't be fixed without `rm -rf`.
+      # The directory itself IS in the repo (secrets/.gitkeep), so the mount always resolves and a
+      # missing token surfaces as a clear Prometheus error instead. Read-only; never in an image.
+      - ./infra/observability/secrets:/etc/prometheus/secrets:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  promdata:

@@ -1,0 +1,38 @@
+# Prometheus scrape config — LOCAL.
+#
+# /metrics is protected by a scrape token: the app compares the `X-Scrape-Token` header against
+# METRICS_SCRAPE_TOKEN. Prometheus injects that header per-job via `http_headers` (Prometheus
+# v2.49+). The token VALUE is never written here — it is read from a file mounted at
+# /etc/prometheus/secrets/scrape_token. No secret in this file.
+#
+# `job_name` is referenced by the alert rules (infra/observability/rules/alerts.yml) — keep the
+# two in sync if you rename it.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  # DO NOT add `external_labels: {version: ...}` — BANNED:
+  # the version must come from the app's `service_info{service,version,environment}` Info-metric, not
+  # from the scraper config (otherwise the metrics keep claiming the old version after every deploy
+  # until someone hand-edits this file). `service`/`instance` would be permissible; see
+  # prometheus.prod.yml for why they are omitted. Join instead:
+  #   sum by (service) (rate(generation_total[5m])) * on() group_left(version) service_info
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: backend
+    metrics_path: /metrics
+    scheme: http
+    http_headers:
+      X-Scrape-Token:
+        # Secret stays out of the config: read from a mounted file.
+        files:
+          - /etc/prometheus/secrets/scrape_token
+    static_configs:
+      - targets:
+          - "api:8000"
+        labels:
+          env: local

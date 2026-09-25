@@ -1,0 +1,40 @@
+# Prometheus scrape config — PROD.
+# Identical contract to infra/observability/prometheus.yml, labelled env: prod.
+# /metrics is protected by METRICS_SCRAPE_TOKEN: Prometheus injects X-Scrape-Token per-job from a
+# mounted file (no secret in this config). Requires Prometheus v2.49+ (http_headers).
+#
+# One Prometheus per instance (each compose project has its own `default` network and its own
+# `api`), so `service` is not templated here — use the instance's own Prometheus/Alertmanager.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  # DO NOT add `external_labels: {version: ...}` — BANNED.
+  # The running version must come from the APPLICATION's Info-metric
+  # `service_info{service,version,environment}` — the only thing that actually knows which code is
+  # live. Declaring `version` here would make the SCRAPER the source of truth: after each deploy the
+  # metrics would keep claiming the old version until someone remembered to edit this file — a
+  # silent, indefinite lie about what is running.
+  # `service` / `instance` WOULD be permissible (they don't change on deploy), but they are omitted
+  # deliberately: there is one Prometheus per instance, `service` already ships in service_info, and
+  # its value comes from SERVICE_NAME — which differs per instance and cannot be interpolated into
+  # this static file. Join on the Info-metric instead:
+  #   sum by (service) (rate(generation_total[5m])) * on() group_left(version) service_info
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: backend
+    metrics_path: /metrics
+    scheme: http
+    http_headers:
+      X-Scrape-Token:
+        files:
+          - /etc/prometheus/secrets/scrape_token
+    static_configs:
+      - targets:
+          - "api:8000"
+        labels:
+          env: prod
